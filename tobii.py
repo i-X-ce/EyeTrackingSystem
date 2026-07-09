@@ -40,8 +40,6 @@ def gaze_callback(gaze_data):
     gaze_data_list.append(row)
 
 def start_recording():
-    print("計測開始")
-
     tracker.subscribe_to(
         tr.EYETRACKER_GAZE_DATA,
         gaze_callback,
@@ -49,8 +47,6 @@ def start_recording():
     )
 
 def stop_recording():
-    print("計測終了")
-
     tracker.unsubscribe_from(
         tr.EYETRACKER_GAZE_DATA,
         gaze_callback
@@ -83,4 +79,3 @@ def stop_recording():
             gaze_data_list
         )
 
-    print("保存完了")
