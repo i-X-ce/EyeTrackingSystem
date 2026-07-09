@@ -2,6 +2,7 @@ import tobii_research as tr
 import csv
 import os
 import time
+from datetime import datetime
 
 
 tracker = None
@@ -61,7 +62,7 @@ def stop_recording():
     )
 
     with open(
-        "data/gaze_pupil_data.csv",
+        f"data/gaze_pupil{datetime.now().strftime('%Y%m%d%H%M%S')}.csv",
         "w",
         newline=""
     ) as f:
