@@ -25,7 +25,7 @@ def connect():
 def gaze_callback(gaze_data):
 
     row = [
-        time.time(),
+        time.time() * 1000,
 
         gaze_data["left_gaze_point_on_display_area"][0],
         gaze_data["left_gaze_point_on_display_area"][1],
