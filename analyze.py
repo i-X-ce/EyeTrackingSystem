@@ -1,5 +1,6 @@
 import os
 import re
+import math
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
@@ -7,6 +8,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.widgets import RangeSlider
 
 # ==========================================
 # 初期設定
@@ -14,20 +16,31 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 plt.rcParams['font.family'] = 'sans-serif'
 plt.rcParams['font.sans-serif'] = ['Hiragino Maru Gothic Pro', 'Yu Gothic', 'Meiryo', 'Takao', 'IPAexGothic', 'IPAPGothic', 'VL PGothic', 'Noto Sans CJK JP']
 
-COLORS = ['#2ca02c', '#ff7f0e', '#1f77b4', '#d62728'] # 緑, オレンジ, 青, 赤
+COLORS = ['#2ca02c', '#ff7f0e', '#1f77b4', '#d62728']
 
 # ==========================================
 # データ処理関数
 # ==========================================
-def extract_time_from_filename(filename):
-    """ファイル名から14桁の時刻(YYYYMMDDHHMMSS)を抽出"""
+def extract_time_and_type(directory, filename):
     match = re.search(r'\d{14}', filename)
-    if match:
-        return datetime.strptime(match.group(), "%Y%m%d%H%M%S")
-    return None
+    time_val = datetime.strptime(match.group(), "%Y%m%d%H%M%S") if match else None
+    
+    ui_type = "Unknown"
+    if 'log' in filename.lower() and time_val:
+        try:
+            df = pd.read_csv(os.path.join(directory, filename))
+            start_row = df[df['tag'] == 'start']
+            if not start_row.empty:
+                msg = str(start_row['message'].values[0])
+                if 'type=view' in msg:
+                    ui_type = "View"
+                elif 'type=classic' in msg:
+                    ui_type = "Classic"
+        except:
+            pass
+    return time_val, ui_type
 
 def auto_pair_files(directory):
-    """ディレクトリ内のファイルを60秒以内のペアに分類する"""
     files = os.listdir(directory)
     gaze_files = [f for f in files if 'gaze' in f.lower() and f.endswith('.csv')]
     log_files = [f for f in files if 'log' in f.lower() and f.endswith('.csv')]
@@ -35,38 +48,40 @@ def auto_pair_files(directory):
     pairs = []
     unpaired = []
     
-    # ログファイルを基準にペアを探す
+    log_info = {}
     for log_f in log_files:
-        log_time = extract_time_from_filename(log_f)
+        t_val, ui_type = extract_time_and_type(directory, log_f)
+        log_info[log_f] = (t_val, ui_type)
+
+    for log_f, (log_time, ui_type) in log_info.items():
         if not log_time:
-            unpaired.append(('log', log_f, "時刻抽出エラー"))
+            unpaired.append(('log', log_f, "時間抽出不可", "Unknown"))
             continue
             
         best_match = None
         min_diff = float('inf')
         
         for gaze_f in gaze_files:
-            gaze_time = extract_time_from_filename(gaze_f)
+            gaze_time, _ = extract_time_and_type(directory, gaze_f)
             if gaze_time:
                 diff = abs((log_time - gaze_time).total_seconds())
                 if diff <= 60 and diff < min_diff:
                     min_diff = diff
                     best_match = gaze_f
                     
-        if best_match:
-            pairs.append((log_f, best_match, min_diff))
-            gaze_files.remove(best_match) # マッチしたものはリストから消す
+        if best_match and min_diff <= 60:
+            pairs.append((log_f, best_match, min_diff, ui_type))
+            gaze_files.remove(best_match)
         else:
-            unpaired.append(('log', log_f, "ペアの視線データなし"))
+            unpaired.append(('log', log_f, "ペアなし(誤差大)", ui_type))
             
-    # 残った視線データはアンペア
     for gaze_f in gaze_files:
-        unpaired.append(('gaze', gaze_f, "ペアのログデータなし"))
+        unpaired.append(('gaze', gaze_f, "ペアなし", "Unknown"))
         
-    return sorted(pairs), unpaired
+    return sorted(pairs, key=lambda x: x[0]), unpaired
 
-def extract_pupil_trajectory(df_log, df_gaze, tag='add'):
-    """カート追加(add)イベント前後の瞳孔変化を抽出"""
+def extract_all_pupil_trajectories(df_log, df_gaze, tag='add'):
+    """指定イベント前後の全軌跡を個別に抽出してリストで返す"""
     events = df_log[df_log['tag'] == tag]['timestamp'].values
     bins = np.arange(-500, 2501, 250)
     bin_centers = bins[:-1] + 125
@@ -81,67 +96,114 @@ def extract_pupil_trajectory(df_log, df_gaze, tag='add'):
             binned['bin'] = binned['bin'].astype(float)
             trajectories.append(binned.set_index('bin')['LeftPupil'])
             
-    if trajectories:
-        return pd.concat(trajectories, axis=1).mean(axis=1)
-    return pd.Series(dtype=float)
+    return trajectories
+
+def calculate_gaze_stability(df_log, df_gaze, tag='add'):
+    events = df_log[df_log['tag'] == tag]['timestamp'].values
+    stds = []
+    for ts in events:
+        window = df_gaze[(df_gaze['Time'] >= ts - 1500) & (df_gaze['Time'] < ts)]
+        if not window.empty and not window['LeftGazeX'].dropna().empty:
+            stds.append(window['LeftGazeX'].std())
+    return np.nanmean(stds) if stds else np.nan
+
+def calculate_mouse_metrics(df_log):
+    df_log['x_num'] = pd.to_numeric(df_log['x'], errors='coerce')
+    df_log['y_num'] = pd.to_numeric(df_log['y'], errors='coerce')
+    df_moves = df_log[df_log['tag'] == 'mouse_move'].dropna(subset=['x_num', 'y_num'])
+    
+    if len(df_moves) < 2:
+        return 0, 1.0
+        
+    dx = df_moves['x_num'].diff()
+    dy = df_moves['y_num'].diff()
+    distances = np.sqrt(dx**2 + dy**2)
+    total_distance = np.nansum(distances)
+    
+    start_pt = (df_moves['x_num'].iloc[0], df_moves['y_num'].iloc[0])
+    end_pt = (df_moves['x_num'].iloc[-1], df_moves['y_num'].iloc[-1])
+    straight_line = math.sqrt((end_pt[0] - start_pt[0])**2 + (end_pt[1] - start_pt[1])**2)
+    
+    ratio = total_distance / straight_line if straight_line > 0 else 1.0
+    return total_distance, ratio
+
+def align_gaze_to_mouse(df_gaze, df_mouse):
+    """視線の範囲(Min-Max)をマウス操作範囲(Min-Max)に自動で同期マッピングする"""
+    gaze_x = df_gaze['LeftGazeX']
+    gaze_y = df_gaze['LeftGazeY']
+    mouse_x = df_mouse['x_num'].dropna()
+    mouse_y = df_mouse['y_num'].dropna()
+    
+    if len(mouse_x) < 2 or len(gaze_x.dropna()) < 2:
+        return gaze_x, gaze_y # フォールバック
+        
+    gx_min, gx_max = gaze_x.min(), gaze_x.max()
+    gy_min, gy_max = gaze_y.min(), gaze_y.max()
+    mx_min, mx_max = mouse_x.min(), mouse_x.max()
+    my_min, my_max = mouse_y.min(), mouse_y.max()
+    
+    # MinMaxスケーリングでマウスの境界ボックスに視線をピッタリはめ込む
+    gaze_x_aligned = (gaze_x - gx_min) / (gx_max - gx_min) * (mx_max - mx_min) + mx_min if gx_max > gx_min else gaze_x * 0 + mx_min
+    gaze_y_aligned = (gaze_y - gy_min) / (gy_max - gy_min) * (my_max - my_min) + my_min if gy_max > gy_min else gaze_y * 0 + my_min
+        
+    return gaze_x_aligned, gaze_y_aligned
 
 # ==========================================
-# Tkinter アプリケーション
+# Tkinter GUI
 # ==========================================
 class EyeTrackingDashboard:
     def __init__(self, root):
         self.root = root
-        self.root.title("視線・操作ログ 統合アナライザー (GUIペアリング対応版)")
+        self.root.title("視線・操作ログ 統合アナライザー")
         self.root.geometry("1400x850")
         
         self.current_dir = "./data/" if os.path.exists("./data/") else os.getcwd()
-        self.paired_data = [] # (log_path, gaze_path)
-        self.loaded_dfs = []  # [(df_log, df_gaze, label, color), ...]
+        self.paired_data = []
+        self.loaded_dfs = []
+        self.sliders = []
         
         self.setup_ui()
         if os.path.exists(self.current_dir):
             self.scan_directory(self.current_dir)
 
     def setup_ui(self):
-        # --- 左側パネル (操作・ファイル選択) ---
-        left_frame = tk.Frame(self.root, width=350, bg="#f0f0f0", padx=10, pady=10)
+        left_frame = tk.Frame(self.root, width=380, bg="#f5f5f5", padx=10, pady=10)
         left_frame.pack(side=tk.LEFT, fill=tk.Y)
         left_frame.pack_propagate(False)
         
         btn_select_dir = tk.Button(left_frame, text="📂 フォルダを選択", command=self.select_directory, font=("", 12, "bold"))
         btn_select_dir.pack(fill=tk.X, pady=(0, 10))
         
-        self.lbl_dir = tk.Label(left_frame, text=f"現在: {self.current_dir}", bg="#f0f0f0", anchor="w", justify="left", wraplength=330)
+        self.lbl_dir = tk.Label(left_frame, text=f"現在: {self.current_dir}", bg="#f5f5f5", anchor="w", justify="left", wraplength=350)
         self.lbl_dir.pack(fill=tk.X, pady=(0, 10))
         
-        tk.Label(left_frame, text="自動ペアリング結果 (60秒以内):", bg="#f0f0f0", font=("", 10, "bold")).pack(anchor="w")
+        tk.Label(left_frame, text="自動ペアリング結果 (60秒以内):", bg="#f5f5f5", font=("", 10, "bold")).pack(anchor="w")
         
-        # ツリービュー (ペア一覧)
-        columns = ("type", "file", "info")
-        self.tree = ttk.Treeview(left_frame, columns=columns, show="headings", selectmode="extended", height=15)
+        columns = ("type", "ui", "file", "info")
+        self.tree = ttk.Treeview(left_frame, columns=columns, show="headings", selectmode="extended", height=18)
         self.tree.heading("type", text="状態")
-        self.tree.heading("file", text="ファイル (Log基準)")
-        self.tree.heading("info", text="詳細/誤差")
-        self.tree.column("type", width=40, anchor="center")
-        self.tree.column("file", width=180)
-        self.tree.column("info", width=100)
+        self.tree.heading("ui", text="UI")
+        self.tree.heading("file", text="ファイル名")
+        self.tree.heading("info", text="時間差")
         
-        # エラー行の背景色設定
+        self.tree.column("type", width=40, anchor="center")
+        self.tree.column("ui", width=60, anchor="center")
+        self.tree.column("file", width=180)
+        self.tree.column("info", width=70, anchor="center")
+        
         self.tree.tag_configure('error', background='#ffcccc')
         self.tree.tag_configure('ok', background='#e6ffe6')
         self.tree.pack(fill=tk.BOTH, expand=True, pady=5)
         
-        # スクロールバー
         scrollbar = ttk.Scrollbar(self.tree, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscroll=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        tk.Label(left_frame, text="※ 比較したいペアを複数選択(Ctrl+クリック)して\n下のボタンを押してください。", bg="#f0f0f0", justify="left").pack(anchor="w", pady=5)
+        tk.Label(left_frame, text="※ 比較したいペアを複数選択して\n下の描画ボタンを押してください。", bg="#f5f5f5", justify="left", fg="#666666").pack(anchor="w", pady=5)
         
-        btn_analyze = tk.Button(left_frame, text="📊 選択したペアを比較・描画", command=self.analyze_selected, font=("", 12, "bold"), bg="#4CAF50", fg="white")
+        btn_analyze = tk.Button(left_frame, text="📊 選択したデータを比較・描画", command=self.analyze_selected, font=("", 12, "bold"), bg="#4CAF50", fg="white")
         btn_analyze.pack(fill=tk.X, pady=10)
 
-        # --- 右側パネル (グラフ描画) ---
         self.right_frame = tk.Frame(self.root)
         self.right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
         
@@ -149,10 +211,14 @@ class EyeTrackingDashboard:
         self.tab1 = ttk.Frame(self.tab_control)
         self.tab2 = ttk.Frame(self.tab_control)
         self.tab3 = ttk.Frame(self.tab_control)
+        self.tab4 = ttk.Frame(self.tab_control)
+        self.tab5 = ttk.Frame(self.tab_control)
         
-        self.tab_control.add(self.tab1, text="  ① 瞳孔径の推移 (add前後)  ")
-        self.tab_control.add(self.tab2, text="  ② 一連の操作・瞬きタイムライン  ")
-        self.tab_control.add(self.tab3, text="  ③ マウス軌跡 (2Dマップ)  ")
+        self.tab_control.add(self.tab1, text="  ① 瞳孔推移 (平均)  ")
+        self.tab_control.add(self.tab2, text="  ② 瞳孔推移 (全試行オーバーラップ)  ")
+        self.tab_control.add(self.tab3, text="  ③ タイムライン (操作・瞬き)  ")
+        self.tab_control.add(self.tab4, text="  ④ 2D全体軌跡 (目線・マウス)  ")
+        self.tab_control.add(self.tab5, text="  ⑤ 【動的】軌跡リプレイ  ")
         self.tab_control.pack(expand=1, fill="both")
 
     def select_directory(self):
@@ -163,160 +229,298 @@ class EyeTrackingDashboard:
             self.scan_directory(directory)
 
     def scan_directory(self, directory):
-        # ツリーをクリア
         for item in self.tree.get_children():
             self.tree.delete(item)
             
         pairs, unpaired = auto_pair_files(directory)
-        self.paired_data = pairs # (log, gaze, diff)
+        self.paired_data = pairs
         
-        # 正常なペアを追加
-        for idx, (log_f, gaze_f, diff) in enumerate(pairs):
+        for idx, (log_f, gaze_f, diff, ui_type) in enumerate(pairs):
             iid = f"pair_{idx}"
-            self.tree.insert("", tk.END, iid=iid, values=("OK", log_f, f"差 {diff:.0f}秒"), tags=('ok',))
+            self.tree.insert("", tk.END, iid=iid, values=("OK", ui_type, log_f, f"{diff:.0f}秒"), tags=('ok',))
             
-        # エラーのファイルを追加
-        for type_f, f_name, reason in unpaired:
-            self.tree.insert("", tk.END, values=("ERR", f_name, reason), tags=('error',))
+        for type_f, f_name, reason, ui_type in unpaired:
+            self.tree.insert("", tk.END, values=("ERR", ui_type, f_name, reason), tags=('error',))
 
     def analyze_selected(self):
         selected_iids = self.tree.selection()
         valid_selections = [iid for iid in selected_iids if iid.startswith("pair_")]
         
         if not valid_selections:
-            messagebox.showwarning("選択エラー", "緑色(OK)のペアを少なくとも1つ選択してください。")
+            messagebox.showwarning("選択エラー", "緑色のペアを選択してください。")
             return
             
-        # グラフ領域をクリア
         for widget in self.tab1.winfo_children(): widget.destroy()
         for widget in self.tab2.winfo_children(): widget.destroy()
         for widget in self.tab3.winfo_children(): widget.destroy()
+        for widget in self.tab4.winfo_children(): widget.destroy()
+        for widget in self.tab5.winfo_children(): widget.destroy()
         
         self.loaded_dfs = []
+        self.sliders = []
         
-        # データのロード
         for i, iid in enumerate(valid_selections):
             idx = int(iid.split("_")[1])
-            log_f, gaze_f, _ = self.paired_data[idx]
+            log_f, gaze_f, _, ui_type = self.paired_data[idx]
             
             try:
                 df_log = pd.read_csv(os.path.join(self.current_dir, log_f))
                 df_gaze = pd.read_csv(os.path.join(self.current_dir, gaze_f))
-                # 汎用的なラベル（ファイル名の先頭1文字 + log）
-                label = f"Data {i+1} ({log_f[:10]}...)"
+                label = f"Data {i+1} ({ui_type})"
                 color = COLORS[i % len(COLORS)]
-                self.loaded_dfs.append((df_log, df_gaze, label, color))
+                self.loaded_dfs.append((df_log, df_gaze, label, color, ui_type))
             except Exception as e:
-                messagebox.showerror("読み込みエラー", f"{log_f} の読み込みに失敗しました。\n{e}")
+                messagebox.showerror("エラー", f"ロード失敗: {log_f}\n{e}")
                 
         if self.loaded_dfs:
             self.draw_tab1()
             self.draw_tab2()
             self.draw_tab3()
+            self.draw_tab4()
+            self.draw_tab5()
 
     def draw_tab1(self):
-        fig, ax = plt.subplots(figsize=(8, 6))
-        for df_log, df_gaze, label, color in self.loaded_dfs:
-            traj = extract_pupil_trajectory(df_log, df_gaze, 'add')
-            if not traj.empty:
-                ax.plot(traj.index, traj.values, label=label, marker='o', linewidth=2.5, color=color)
+        fig, ax = plt.subplots(figsize=(8, 5))
+        text_info = "【決定(add)直前の視線X軸ブレ(標準偏差)】\n"
+        for df_log, df_gaze, label, color, ui_type in self.loaded_dfs:
+            trajectories = extract_all_pupil_trajectories(df_log, df_gaze, 'add')
+            if trajectories:
+                mean_traj = pd.concat(trajectories, axis=1).mean(axis=1)
+                ax.plot(mean_traj.index, mean_traj.values, label=f"{label} (平均)", marker='o', linewidth=2.5, color=color)
+            stability = calculate_gaze_stability(df_log, df_gaze, 'add')
+            text_info += f"・{label}: {stability:.4f}\n"
                 
         ax.axvline(x=0, color='red', linestyle='--', alpha=0.6, label='カート追加(0ms)')
-        ax.set_title("【add】クリック前後の瞳孔径の推移", fontsize=14, fontweight='bold')
+        ax.set_title("【add】瞳孔径の推移 (平均値) ＆ 視線安定性", fontsize=13, fontweight='bold')
         ax.set_xlabel("操作からの相対時間 (ミリ秒)")
-        ax.set_ylabel("瞳孔径 (LeftPupil)")
-        ax.legend()
+        ax.set_ylabel("瞳孔径 (LeftPupil 相対値)")
+        ax.legend(loc="upper right")
         ax.grid(True, alpha=0.3)
+        fig.text(0.15, 0.18, text_info, bbox=dict(facecolor='white', alpha=0.8, boxstyle='round,pad=0.5'), fontsize=10)
         
         canvas = FigureCanvasTkAgg(fig, master=self.tab1)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
 
     def draw_tab2(self):
+        """新タブ: すべての瞳孔軌跡をオーバーラップ表示"""
         num_plots = len(self.loaded_dfs)
-        fig, axes = plt.subplots(num_plots, 1, figsize=(10, 2.5 * num_plots), sharex=True)
-        if num_plots == 1:
-            axes = [axes]
-            
-        for i, (df_log, df_gaze, label, color) in enumerate(self.loaded_dfs):
-            ax = axes[i]
-            start_row = df_log[df_log['tag'] == 'start']
-            order_row = df_log[df_log['tag'] == 'order']
-            
-            if start_row.empty or order_row.empty:
-                ax.text(0.5, 0.5, "start または order ログが見つかりません", ha='center')
-                continue
-                
-            start_ts = start_row['timestamp'].values[0]
-            order_ts = order_row['timestamp'].values[0]
-            
-            df_gaze_filtered = df_gaze[(df_gaze['Time'] >= start_ts) & (df_gaze['Time'] <= order_ts)].copy()
-            time_sec = (df_gaze_filtered['Time'] - start_ts) / 1000.0
-            
-            ax.plot(time_sec, df_gaze_filtered['LeftPupil'], color=color, alpha=0.6)
-            
-            # 瞬き（NaN）区間を赤背景
-            nan_blocks = np.where(df_gaze_filtered['LeftPupil'].isna())[0]
-            for idx in nan_blocks:
-                ax.axvline(time_sec.iloc[idx], color='red', alpha=0.03, zorder=1)
-                
-            # イベントプロット
-            df_events = df_log[(df_log['timestamp'] >= start_ts) & (df_log['timestamp'] <= order_ts)]
-            for _, row in df_events.iterrows():
-                event_time = (row['timestamp'] - start_ts) / 1000.0
-                tag = row['tag']
-                if tag == 'add':
-                    ax.axvline(event_time, color='blue', linestyle='-', alpha=0.7)
-                    ax.text(event_time, ax.get_ylim()[1]*0.9, 'Add', color='blue', fontsize=8, rotation=90)
-                elif tag == 'open_modal':
-                    ax.axvline(event_time, color='purple', linestyle=':', alpha=0.7)
-                    ax.text(event_time, ax.get_ylim()[1]*0.9, 'Open', color='purple', fontsize=8, rotation=90)
-                    
-            ax.set_title(label, fontsize=10, fontweight='bold')
-            ax.grid(True, alpha=0.2)
-            
-        axes[-1].set_xlabel("実験開始からの経過時間 (秒)")
-        plt.tight_layout()
+        fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 5), sharey=True)
+        if num_plots == 1: axes = [axes]
         
+        for i, (df_log, df_gaze, label, color, ui_type) in enumerate(self.loaded_dfs):
+            ax = axes[i]
+            trajectories = extract_all_pupil_trajectories(df_log, df_gaze, 'add')
+            if trajectories:
+                # 全ての線を薄く描画
+                for traj in trajectories:
+                    ax.plot(traj.index, traj.values, color=color, alpha=0.15, linewidth=1.0)
+                # 平均線を太く上に重ねる
+                mean_traj = pd.concat(trajectories, axis=1).mean(axis=1)
+                ax.plot(mean_traj.index, mean_traj.values, label="平均値", marker='o', linewidth=3.0, color='black', alpha=0.8)
+                
+            ax.axvline(x=0, color='red', linestyle='--', alpha=0.6, label='カート追加(0ms)')
+            ax.set_title(f"{label}\n全 {len(trajectories)} 試行の分布", fontsize=11, fontweight='bold')
+            ax.set_xlabel("相対時間 (ミリ秒)")
+            if i == 0: ax.set_ylabel("瞳孔径")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+        plt.tight_layout()
         canvas = FigureCanvasTkAgg(fig, master=self.tab2)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
 
     def draw_tab3(self):
-        """マウス軌跡を2D空間にマッピング"""
+        """タブ3(旧2): タイムライン (close削除)"""
         num_plots = len(self.loaded_dfs)
-        # 横並びに配置
-        fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 6))
-        if num_plots == 1:
-            axes = [axes]
+        fig, axes = plt.subplots(num_plots, 1, figsize=(10, 2.5 * num_plots), sharex=True)
+        if num_plots == 1: axes = [axes]
             
-        for i, (df_log, _, label, color) in enumerate(self.loaded_dfs):
+        for i, (df_log, df_gaze, label, color, ui_type) in enumerate(self.loaded_dfs):
             ax = axes[i]
+            start_row = df_log[df_log['tag'] == 'start']
+            order_row = df_log[df_log['tag'] == 'order']
+            if start_row.empty: continue
+                
+            start_ts = start_row['timestamp'].values[0]
+            order_ts = order_row['timestamp'].values[0] if not order_row.empty else df_log['timestamp'].max()
+            df_gaze_filtered = df_gaze[(df_gaze['Time'] >= start_ts) & (df_gaze['Time'] <= order_ts)].copy()
+            time_sec = (df_gaze_filtered['Time'] - start_ts) / 1000.0
             
-            # X, Y を数値に変換（エラーは無視）
+            ax.plot(time_sec, df_gaze_filtered['LeftPupil'], color=color, alpha=0.6, label="瞳孔径")
+            nan_blocks = np.where(df_gaze_filtered['LeftPupil'].isna())[0]
+            for idx in nan_blocks:
+                ax.axvline(time_sec.iloc[idx], color='red', alpha=0.03, zorder=1)
+                
+            df_events = df_log[(df_log['timestamp'] >= start_ts) & (df_log['timestamp'] <= order_ts)]
+            for _, row in df_events.iterrows():
+                event_time = (row['timestamp'] - start_ts) / 1000.0
+                tag = row['tag']
+                if tag == 'add':
+                    ax.axvline(event_time, color='blue', linestyle='-', alpha=0.8)
+                    ax.text(event_time, ax.get_ylim()[1]*0.9, 'Add', color='blue', fontsize=8, rotation=90)
+                elif tag == 'open_modal':
+                    ax.axvline(event_time, color='purple', linestyle=':', alpha=0.8)
+                    ax.text(event_time, ax.get_ylim()[1]*0.95, 'Open', color='purple', fontsize=8, rotation=90)
+                # close_modal は描画しない
+                    
+            ax.set_title(label, fontsize=10, fontweight='bold')
+            ax.set_ylabel("瞳孔径")
+            ax.grid(True, alpha=0.2)
+            
+        axes[-1].set_xlabel("タスク開始からの経過時間 (秒)")
+        plt.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=self.tab3)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
+
+    def draw_tab4(self):
+        """タブ4(旧3): 2Dマップ (視線同期・close削除)"""
+        num_plots = len(self.loaded_dfs)
+        fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 6))
+        if num_plots == 1: axes = [axes]
+            
+        for i, (df_log, df_gaze, label, color, ui_type) in enumerate(self.loaded_dfs):
+            ax = axes[i]
             df_log['x_num'] = pd.to_numeric(df_log['x'], errors='coerce')
             df_log['y_num'] = pd.to_numeric(df_log['y'], errors='coerce')
-            
-            # マウス移動の軌跡を線で描画
             df_mouse = df_log[df_log['tag'] == 'mouse_move'].dropna(subset=['x_num', 'y_num'])
-            ax.plot(df_mouse['x_num'], df_mouse['y_num'], color=color, alpha=0.3, linewidth=1, label='マウス軌跡')
             
-            # クリックイベント（add）を星マークで描画
+            # マウス軌跡
+            ax.plot(df_mouse['x_num'], df_mouse['y_num'], color=color, alpha=0.3, linewidth=1.5, label='マウス軌跡')
+            
+            # 視線をマウスの境界に自動マッピング
+            gaze_x_sync, gaze_y_sync = align_gaze_to_mouse(df_gaze, df_mouse)
+            ax.plot(gaze_x_sync, gaze_y_sync, color=color, linestyle=':', alpha=0.15, linewidth=0.8, label='視線軌跡 (同期)')
+            
+            # イベントプロット (close削除)
             df_add = df_log[df_log['tag'] == 'add'].dropna(subset=['x_num', 'y_num'])
-            ax.scatter(df_add['x_num'], df_add['y_num'], color='red', marker='*', s=150, zorder=5, label='カート追加(add)')
+            ax.scatter(df_add['x_num'], df_add['y_num'], color='red', marker='*', s=150, zorder=5, label='Add')
+            df_open = df_log[df_log['tag'] == 'open_modal'].dropna(subset=['x_num', 'y_num'])
+            ax.scatter(df_open['x_num'], df_open['y_num'], color='purple', marker='o', s=60, zorder=4, label='Open')
             
-            # 画面仕様に合わせてY軸を反転 (上が0、下が最大)
             ax.invert_yaxis()
             
-            ax.set_title(f"{label}：マウス軌跡", fontsize=11, fontweight='bold')
-            ax.set_xlabel("X座標")
-            ax.set_ylabel("Y座標")
-            ax.legend(loc='lower right')
+            total_dist, ratio = calculate_mouse_metrics(df_log)
+            ax.set_title(f"{label}\n総距離: {total_dist:.0f}px | 迂回比率: {ratio:.2f}倍", fontsize=10, fontweight='bold')
+            ax.legend(loc='lower right', fontsize=8)
             ax.grid(True, alpha=0.2)
             
         plt.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=self.tab4)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
+
+    def draw_tab5(self):
+        """タブ5(旧4): 軌跡リプレイ (視線同期・close削除)"""
+        num_plots = len(self.loaded_dfs)
+        fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 6))
+        fig.subplots_adjust(bottom=0.25)
+        if num_plots == 1: axes = [axes]
         
-        canvas = FigureCanvasTkAgg(fig, master=self.tab3)
+        self.plot_elements = [] 
+        max_duration = 0 
+        self.processed_data = []
+        
+        for i, (df_log, df_gaze, label, color, ui_type) in enumerate(self.loaded_dfs):
+            ax = axes[i]
+            start_row = df_log[df_log['tag'] == 'start']
+            order_row = df_log[df_log['tag'] == 'order']
+            if start_row.empty: continue
+                
+            start_ts = start_row['timestamp'].values[0]
+            order_ts = order_row['timestamp'].values[0] if not order_row.empty else df_log['timestamp'].max()
+            duration = (order_ts - start_ts) / 1000.0
+            max_duration = max(max_duration, duration)
+            
+            log_work = df_log[(df_log['timestamp'] >= start_ts) & (df_log['timestamp'] <= order_ts)].copy()
+            log_work['time_sec'] = (log_work['timestamp'] - start_ts) / 1000.0
+            log_work['x_num'] = pd.to_numeric(log_work['x'], errors='coerce')
+            log_work['y_num'] = pd.to_numeric(log_work['y'], errors='coerce')
+            df_mouse_bounds = log_work[log_work['tag'] == 'mouse_move']
+            
+            gaze_work = df_gaze[(df_gaze['Time'] >= start_ts) & (df_gaze['Time'] <= order_ts)].copy()
+            gaze_work['time_sec'] = (gaze_work['Time'] - start_ts) / 1000.0
+            
+            # リプレイ用にも自動マッピングを適用
+            gx_sync, gy_sync = align_gaze_to_mouse(gaze_work, df_mouse_bounds)
+            gaze_work['gaze_x_px'] = gx_sync
+            gaze_work['gaze_y_px'] = gy_sync
+            
+            # マウス可動域を基準に表示範囲を固定
+            m_xmin, m_xmax = df_mouse_bounds['x_num'].min(), df_mouse_bounds['x_num'].max()
+            m_ymin, m_ymax = df_mouse_bounds['y_num'].min(), df_mouse_bounds['y_num'].max()
+            
+            if pd.notna(m_xmin) and pd.notna(m_xmax):
+                # 余裕を持たせる
+                ax.set_xlim(m_xmin - 50, m_xmax + 50)
+                ax.set_ylim(m_ymax + 50, m_ymin - 50) # 反転
+            
+            ax.set_title(f"{label} (動的リプレイ)", fontsize=11, fontweight='bold')
+            ax.grid(True, alpha=0.2)
+            
+            self.processed_data.append({
+                'ax': ax, 'log': log_work, 'gaze': gaze_work, 'color': color
+            })
+            self.plot_elements.append({'lines': [], 'scatters': []})
+
+        if max_duration == 0: return
+
+        slider_ax = fig.add_axes([0.15, 0.05, 0.7, 0.05])
+        init_min = 0
+        init_max = min(10.0, max_duration)
+        range_slider = RangeSlider(slider_ax, "表示時間(秒)", 0, max_duration, valinit=(init_min, init_max), color='#1f77b4')
+
+        def update_plot(val):
+            t_min, t_max = val
+            for i, data in enumerate(self.processed_data):
+                ax = data['ax']
+                log_df = data['log']
+                gaze_df = data['gaze']
+                c = data['color']
+                elements = self.plot_elements[i]
+                
+                for l in elements['lines']: l.remove()
+                for s in elements['scatters']: s.remove()
+                elements['lines'].clear()
+                elements['scatters'].clear()
+                
+                # マウス描画
+                mask_log = (log_df['time_sec'] >= t_min) & (log_df['time_sec'] <= t_max)
+                cur_log = log_df[mask_log]
+                cur_mouse = cur_log[cur_log['tag'] == 'mouse_move'].dropna(subset=['x_num', 'y_num'])
+                
+                if not cur_mouse.empty:
+                    l_mouse, = ax.plot(cur_mouse['x_num'], cur_mouse['y_num'], color=c, alpha=0.8, linewidth=2, label='Mouse')
+                    elements['lines'].append(l_mouse)
+
+                # 視線描画 (薄い点線)
+                mask_gaze = (gaze_df['time_sec'] >= t_min) & (gaze_df['time_sec'] <= t_max)
+                cur_gaze = gaze_df[mask_gaze].dropna(subset=['gaze_x_px', 'gaze_y_px'])
+                
+                if not cur_gaze.empty:
+                    l_gaze, = ax.plot(cur_gaze['gaze_x_px'], cur_gaze['gaze_y_px'], color=c, linestyle=':', alpha=0.4, linewidth=1.5, label='Gaze')
+                    elements['lines'].append(l_gaze)
+                    
+                # イベントマーク (Close削除)
+                cur_add = cur_log[cur_log['tag'] == 'add'].dropna(subset=['x_num', 'y_num'])
+                if not cur_add.empty:
+                    sc = ax.scatter(cur_add['x_num'], cur_add['y_num'], color='red', marker='*', s=200, zorder=5)
+                    elements['scatters'].append(sc)
+                    
+                cur_open = cur_log[cur_log['tag'] == 'open_modal'].dropna(subset=['x_num', 'y_num'])
+                if not cur_open.empty:
+                    sc = ax.scatter(cur_open['x_num'], cur_open['y_num'], color='purple', marker='o', s=80, zorder=4)
+                    elements['scatters'].append(sc)
+                
+            fig.canvas.draw_idle()
+
+        range_slider.on_changed(update_plot)
+        self.sliders.append(range_slider)
+        update_plot((init_min, init_max))
+
+        canvas = FigureCanvasTkAgg(fig, master=self.tab5)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
 
