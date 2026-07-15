@@ -16,7 +16,7 @@ from matplotlib.widgets import RangeSlider
 plt.rcParams['font.family'] = 'sans-serif'
 plt.rcParams['font.sans-serif'] = ['Hiragino Maru Gothic Pro', 'Yu Gothic', 'Meiryo', 'Takao', 'IPAexGothic', 'IPAPGothic', 'VL PGothic', 'Noto Sans CJK JP']
 
-COLORS = ['#2ca02c', '#ff7f0e', '#1f77b4', '#d62728']
+COLORS = ['#2ca02c', '#ff7f0e', '#1f77b4']
 
 # ==========================================
 # データ処理関数
