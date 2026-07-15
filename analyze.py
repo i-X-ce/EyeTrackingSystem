@@ -18,6 +18,10 @@ plt.rcParams['font.sans-serif'] = ['Hiragino Maru Gothic Pro', 'Yu Gothic', 'Mei
 
 COLORS = ['#2ca02c', '#ff7f0e', '#1f77b4']
 
+# 解析対象とする標準的な画面解像度
+SCREEN_WIDTH = 1920
+SCREEN_HEIGHT = 1080
+
 # ==========================================
 # データ処理関数
 # ==========================================
@@ -81,7 +85,6 @@ def auto_pair_files(directory):
     return sorted(pairs, key=lambda x: x[0]), unpaired
 
 def extract_all_pupil_trajectories(df_log, df_gaze, tag='add'):
-    """指定イベント前後の全軌跡を個別に抽出してリストで返す"""
     events = df_log[df_log['tag'] == tag]['timestamp'].values
     bins = np.arange(-500, 2501, 250)
     bin_centers = bins[:-1] + 125
@@ -127,24 +130,29 @@ def calculate_mouse_metrics(df_log):
     ratio = total_distance / straight_line if straight_line > 0 else 1.0
     return total_distance, ratio
 
-def align_gaze_to_mouse(df_gaze, df_mouse):
-    """視線の範囲(Min-Max)をマウス操作範囲(Min-Max)に自動で同期マッピングする"""
+def align_gaze_to_screen(df_gaze, screen_width=1920, screen_height=1080):
+    """視線データを画面全体の領域（指定された画面解像度）に自動で同期マッピングする"""
     gaze_x = df_gaze['LeftGazeX']
     gaze_y = df_gaze['LeftGazeY']
-    mouse_x = df_mouse['x_num'].dropna()
-    mouse_y = df_mouse['y_num'].dropna()
     
-    if len(mouse_x) < 2 or len(gaze_x.dropna()) < 2:
+    valid_x = gaze_x.dropna()
+    valid_y = gaze_y.dropna()
+    
+    if len(valid_x) < 2 or len(valid_y) < 2:
         return gaze_x, gaze_y # フォールバック
         
-    gx_min, gx_max = gaze_x.min(), gaze_x.max()
-    gy_min, gy_max = gaze_y.min(), gaze_y.max()
-    mx_min, mx_max = mouse_x.min(), mouse_x.max()
-    my_min, my_max = mouse_y.min(), mouse_y.max()
+    gx_min, gx_max = valid_x.min(), valid_x.max()
+    gy_min, gy_max = valid_y.min(), valid_y.max()
     
-    # MinMaxスケーリングでマウスの境界ボックスに視線をピッタリはめ込む
-    gaze_x_aligned = (gaze_x - gx_min) / (gx_max - gx_min) * (mx_max - mx_min) + mx_min if gx_max > gx_min else gaze_x * 0 + mx_min
-    gaze_y_aligned = (gaze_y - gy_min) / (gy_max - gy_min) * (my_max - my_min) + my_min if gy_max > gy_min else gaze_y * 0 + my_min
+    # 異常値（左下への伸び等）に引っ張られないよう、95パーセンタイルで正規化データか判定
+    # ピクセル座標なら95%値は数百〜千以上になるため、5.0以下なら間違いなく0~1の正規化座標系とみなす
+    if valid_x.quantile(0.95) <= 5.0 and valid_y.quantile(0.95) <= 5.0:
+        gaze_x_aligned = gaze_x * screen_width
+        gaze_y_aligned = gaze_y * screen_height
+    else:
+        # すでにピクセル座標系であると判定された場合のフォールバック（Min-Max）
+        gaze_x_aligned = (gaze_x - gx_min) / (gx_max - gx_min) * screen_width if gx_max > gx_min else gaze_x * 0
+        gaze_y_aligned = (gaze_y - gy_min) / (gy_max - gy_min) * screen_height if gy_max > gy_min else gaze_y * 0
         
     return gaze_x_aligned, gaze_y_aligned
 
@@ -303,7 +311,7 @@ class EyeTrackingDashboard:
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
 
     def draw_tab2(self):
-        """新タブ: すべての瞳孔軌跡をオーバーラップ表示"""
+        """すべての瞳孔軌跡をオーバーラップ表示"""
         num_plots = len(self.loaded_dfs)
         fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 5), sharey=True)
         if num_plots == 1: axes = [axes]
@@ -312,10 +320,8 @@ class EyeTrackingDashboard:
             ax = axes[i]
             trajectories = extract_all_pupil_trajectories(df_log, df_gaze, 'add')
             if trajectories:
-                # 全ての線を薄く描画
                 for traj in trajectories:
                     ax.plot(traj.index, traj.values, color=color, alpha=0.15, linewidth=1.0)
-                # 平均線を太く上に重ねる
                 mean_traj = pd.concat(trajectories, axis=1).mean(axis=1)
                 ax.plot(mean_traj.index, mean_traj.values, label="平均値", marker='o', linewidth=3.0, color='black', alpha=0.8)
                 
@@ -332,7 +338,7 @@ class EyeTrackingDashboard:
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
 
     def draw_tab3(self):
-        """タブ3(旧2): タイムライン (close削除)"""
+        """タイムライン"""
         num_plots = len(self.loaded_dfs)
         fig, axes = plt.subplots(num_plots, 1, figsize=(10, 2.5 * num_plots), sharex=True)
         if num_plots == 1: axes = [axes]
@@ -363,7 +369,6 @@ class EyeTrackingDashboard:
                 elif tag == 'open_modal':
                     ax.axvline(event_time, color='purple', linestyle=':', alpha=0.8)
                     ax.text(event_time, ax.get_ylim()[1]*0.95, 'Open', color='purple', fontsize=8, rotation=90)
-                # close_modal は描画しない
                     
             ax.set_title(label, fontsize=10, fontweight='bold')
             ax.set_ylabel("瞳孔径")
@@ -376,7 +381,7 @@ class EyeTrackingDashboard:
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
 
     def draw_tab4(self):
-        """タブ4(旧3): 2Dマップ (視線同期・close削除)"""
+        """タブ4: 2Dマップ (画面サイズに合わせたアライメント)"""
         num_plots = len(self.loaded_dfs)
         fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 6))
         if num_plots == 1: axes = [axes]
@@ -390,17 +395,19 @@ class EyeTrackingDashboard:
             # マウス軌跡
             ax.plot(df_mouse['x_num'], df_mouse['y_num'], color=color, alpha=0.3, linewidth=1.5, label='マウス軌跡')
             
-            # 視線をマウスの境界に自動マッピング
-            gaze_x_sync, gaze_y_sync = align_gaze_to_mouse(df_gaze, df_mouse)
-            ax.plot(gaze_x_sync, gaze_y_sync, color=color, linestyle=':', alpha=0.15, linewidth=0.8, label='視線軌跡 (同期)')
+            # 視線データを1920x1080解像度基準でアライメント
+            gaze_x_sync, gaze_y_sync = align_gaze_to_screen(df_gaze, SCREEN_WIDTH, SCREEN_HEIGHT)
+            ax.plot(gaze_x_sync, gaze_y_sync, color=color, linestyle=':', alpha=0.15, linewidth=0.8, label='視線軌跡 (画面マッピング)')
             
-            # イベントプロット (close削除)
+            # イベントプロット
             df_add = df_log[df_log['tag'] == 'add'].dropna(subset=['x_num', 'y_num'])
             ax.scatter(df_add['x_num'], df_add['y_num'], color='red', marker='*', s=150, zorder=5, label='Add')
             df_open = df_log[df_log['tag'] == 'open_modal'].dropna(subset=['x_num', 'y_num'])
             ax.scatter(df_open['x_num'], df_open['y_num'], color='purple', marker='o', s=60, zorder=4, label='Open')
             
-            ax.invert_yaxis()
+            # 描画表示範囲を1920x1080画面に固定し、Y軸を反転（左上が0,0）
+            ax.set_xlim(0, SCREEN_WIDTH)
+            ax.set_ylim(SCREEN_HEIGHT, 0)
             
             total_dist, ratio = calculate_mouse_metrics(df_log)
             ax.set_title(f"{label}\n総距離: {total_dist:.0f}px | 迂回比率: {ratio:.2f}倍", fontsize=10, fontweight='bold')
@@ -413,7 +420,7 @@ class EyeTrackingDashboard:
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
 
     def draw_tab5(self):
-        """タブ5(旧4): 軌跡リプレイ (視線同期・close削除)"""
+        """タブ5: 軌跡リプレイ (画面サイズに合わせた動的リプレイ)"""
         num_plots = len(self.loaded_dfs)
         fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 6))
         fig.subplots_adjust(bottom=0.25)
@@ -438,24 +445,18 @@ class EyeTrackingDashboard:
             log_work['time_sec'] = (log_work['timestamp'] - start_ts) / 1000.0
             log_work['x_num'] = pd.to_numeric(log_work['x'], errors='coerce')
             log_work['y_num'] = pd.to_numeric(log_work['y'], errors='coerce')
-            df_mouse_bounds = log_work[log_work['tag'] == 'mouse_move']
             
             gaze_work = df_gaze[(df_gaze['Time'] >= start_ts) & (df_gaze['Time'] <= order_ts)].copy()
             gaze_work['time_sec'] = (gaze_work['Time'] - start_ts) / 1000.0
             
-            # リプレイ用にも自動マッピングを適用
-            gx_sync, gy_sync = align_gaze_to_mouse(gaze_work, df_mouse_bounds)
+            # リプレイ用にも解像度基準アライメントを適用
+            gx_sync, gy_sync = align_gaze_to_screen(gaze_work, SCREEN_WIDTH, SCREEN_HEIGHT)
             gaze_work['gaze_x_px'] = gx_sync
             gaze_work['gaze_y_px'] = gy_sync
             
-            # マウス可動域を基準に表示範囲を固定
-            m_xmin, m_xmax = df_mouse_bounds['x_num'].min(), df_mouse_bounds['x_num'].max()
-            m_ymin, m_ymax = df_mouse_bounds['y_num'].min(), df_mouse_bounds['y_num'].max()
-            
-            if pd.notna(m_xmin) and pd.notna(m_xmax):
-                # 余裕を持たせる
-                ax.set_xlim(m_xmin - 50, m_xmax + 50)
-                ax.set_ylim(m_ymax + 50, m_ymin - 50) # 反転
+            # 描画表示範囲を1920x1080画面に固定し、Y軸を反転（左上が0,0）
+            ax.set_xlim(0, SCREEN_WIDTH)
+            ax.set_ylim(SCREEN_HEIGHT, 0)
             
             ax.set_title(f"{label} (動的リプレイ)", fontsize=11, fontweight='bold')
             ax.grid(True, alpha=0.2)
@@ -503,7 +504,7 @@ class EyeTrackingDashboard:
                     l_gaze, = ax.plot(cur_gaze['gaze_x_px'], cur_gaze['gaze_y_px'], color=c, linestyle=':', alpha=0.4, linewidth=1.5, label='Gaze')
                     elements['lines'].append(l_gaze)
                     
-                # イベントマーク (Close削除)
+                # イベントマーク
                 cur_add = cur_log[cur_log['tag'] == 'add'].dropna(subset=['x_num', 'y_num'])
                 if not cur_add.empty:
                     sc = ax.scatter(cur_add['x_num'], cur_add['y_num'], color='red', marker='*', s=200, zorder=5)
