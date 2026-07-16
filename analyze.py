@@ -131,7 +131,6 @@ def calculate_mouse_metrics(df_log):
     return total_distance, ratio
 
 def align_gaze_to_screen(df_gaze, screen_width=1920, screen_height=1080):
-    """視線データを画面全体の領域（指定された画面解像度）に自動で同期マッピングする"""
     gaze_x = df_gaze['LeftGazeX']
     gaze_y = df_gaze['LeftGazeY']
     
@@ -139,22 +138,45 @@ def align_gaze_to_screen(df_gaze, screen_width=1920, screen_height=1080):
     valid_y = gaze_y.dropna()
     
     if len(valid_x) < 2 or len(valid_y) < 2:
-        return gaze_x, gaze_y # フォールバック
+        return gaze_x, gaze_y
         
     gx_min, gx_max = valid_x.min(), valid_x.max()
     gy_min, gy_max = valid_y.min(), valid_y.max()
     
-    # 異常値（左下への伸び等）に引っ張られないよう、95パーセンタイルで正規化データか判定
-    # ピクセル座標なら95%値は数百〜千以上になるため、5.0以下なら間違いなく0~1の正規化座標系とみなす
     if valid_x.quantile(0.95) <= 5.0 and valid_y.quantile(0.95) <= 5.0:
         gaze_x_aligned = gaze_x * screen_width
         gaze_y_aligned = gaze_y * screen_height
     else:
-        # すでにピクセル座標系であると判定された場合のフォールバック（Min-Max）
         gaze_x_aligned = (gaze_x - gx_min) / (gx_max - gx_min) * screen_width if gx_max > gx_min else gaze_x * 0
         gaze_y_aligned = (gaze_y - gy_min) / (gy_max - gy_min) * screen_height if gy_max > gy_min else gaze_y * 0
         
     return gaze_x_aligned, gaze_y_aligned
+
+def calculate_task_durations(df_log):
+    """総所要時間と、各モーダル展開からカート追加(add)までの時間を計算する"""
+    start_row = df_log[df_log['tag'] == 'start']
+    order_row = df_log[df_log['tag'] == 'order']
+    if start_row.empty:
+        return 0, []
+        
+    start_ts = start_row['timestamp'].values[0]
+    order_ts = order_row['timestamp'].values[0] if not order_row.empty else df_log['timestamp'].max()
+    total_time = (order_ts - start_ts) / 1000.0
+    
+    subtask_durations = []
+    open_ts = None
+    
+    # 時系列に沿ってopen_modalからaddまでの時間を紐づけ
+    df_filtered = df_log[(df_log['timestamp'] >= start_ts) & (df_log['timestamp'] <= order_ts)].sort_values('timestamp')
+    for _, row in df_filtered.iterrows():
+        if row['tag'] == 'open_modal':
+            open_ts = row['timestamp']
+        elif row['tag'] == 'add' and open_ts is not None:
+            dur = (row['timestamp'] - open_ts) / 1000.0
+            subtask_durations.append(dur)
+            open_ts = None # リセット
+            
+    return total_time, subtask_durations
 
 # ==========================================
 # Tkinter GUI
@@ -221,12 +243,14 @@ class EyeTrackingDashboard:
         self.tab3 = ttk.Frame(self.tab_control)
         self.tab4 = ttk.Frame(self.tab_control)
         self.tab5 = ttk.Frame(self.tab_control)
+        self.tab6 = ttk.Frame(self.tab_control) # 新タブの生成
         
         self.tab_control.add(self.tab1, text="  ① 瞳孔推移 (平均)  ")
         self.tab_control.add(self.tab2, text="  ② 瞳孔推移 (全試行オーバーラップ)  ")
         self.tab_control.add(self.tab3, text="  ③ タイムライン (操作・瞬き)  ")
         self.tab_control.add(self.tab4, text="  ④ 2D全体軌跡 (目線・マウス)  ")
         self.tab_control.add(self.tab5, text="  ⑤ 【動的】軌跡リプレイ  ")
+        self.tab_control.add(self.tab6, text="  ⑥ 所要時間分析  ") # ノートブックへの追加
         self.tab_control.pack(expand=1, fill="both")
 
     def select_directory(self):
@@ -263,6 +287,7 @@ class EyeTrackingDashboard:
         for widget in self.tab3.winfo_children(): widget.destroy()
         for widget in self.tab4.winfo_children(): widget.destroy()
         for widget in self.tab5.winfo_children(): widget.destroy()
+        for widget in self.tab6.winfo_children(): widget.destroy() # クリア
         
         self.loaded_dfs = []
         self.sliders = []
@@ -286,6 +311,7 @@ class EyeTrackingDashboard:
             self.draw_tab3()
             self.draw_tab4()
             self.draw_tab5()
+            self.draw_tab6() # 描画関数の呼び出し
 
     def draw_tab1(self):
         fig, ax = plt.subplots(figsize=(8, 5))
@@ -311,7 +337,6 @@ class EyeTrackingDashboard:
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
 
     def draw_tab2(self):
-        """すべての瞳孔軌跡をオーバーラップ表示"""
         num_plots = len(self.loaded_dfs)
         fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 5), sharey=True)
         if num_plots == 1: axes = [axes]
@@ -338,7 +363,6 @@ class EyeTrackingDashboard:
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
 
     def draw_tab3(self):
-        """タイムライン"""
         num_plots = len(self.loaded_dfs)
         fig, axes = plt.subplots(num_plots, 1, figsize=(10, 2.5 * num_plots), sharex=True)
         if num_plots == 1: axes = [axes]
@@ -354,8 +378,12 @@ class EyeTrackingDashboard:
             df_gaze_filtered = df_gaze[(df_gaze['Time'] >= start_ts) & (df_gaze['Time'] <= order_ts)].copy()
             time_sec = (df_gaze_filtered['Time'] - start_ts) / 1000.0
             
+            is_nan = df_gaze_filtered['LeftPupil'].isna()
+            blink_starts = is_nan & ~is_nan.shift(1, fill_value=False)
+            blink_count = blink_starts.sum()
+            
             ax.plot(time_sec, df_gaze_filtered['LeftPupil'], color=color, alpha=0.6, label="瞳孔径")
-            nan_blocks = np.where(df_gaze_filtered['LeftPupil'].isna())[0]
+            nan_blocks = np.where(is_nan)[0]
             for idx in nan_blocks:
                 ax.axvline(time_sec.iloc[idx], color='red', alpha=0.03, zorder=1)
                 
@@ -370,7 +398,7 @@ class EyeTrackingDashboard:
                     ax.axvline(event_time, color='purple', linestyle=':', alpha=0.8)
                     ax.text(event_time, ax.get_ylim()[1]*0.95, 'Open', color='purple', fontsize=8, rotation=90)
                     
-            ax.set_title(label, fontsize=10, fontweight='bold')
+            ax.set_title(f"{label} ｜ 瞬き回数: {blink_count}回", fontsize=11, fontweight='bold')
             ax.set_ylabel("瞳孔径")
             ax.grid(True, alpha=0.2)
             
@@ -381,7 +409,6 @@ class EyeTrackingDashboard:
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
 
     def draw_tab4(self):
-        """タブ4: 2Dマップ (画面サイズに合わせたアライメント)"""
         num_plots = len(self.loaded_dfs)
         fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 6))
         if num_plots == 1: axes = [axes]
@@ -392,20 +419,16 @@ class EyeTrackingDashboard:
             df_log['y_num'] = pd.to_numeric(df_log['y'], errors='coerce')
             df_mouse = df_log[df_log['tag'] == 'mouse_move'].dropna(subset=['x_num', 'y_num'])
             
-            # マウス軌跡
             ax.plot(df_mouse['x_num'], df_mouse['y_num'], color=color, alpha=0.3, linewidth=1.5, label='マウス軌跡')
             
-            # 視線データを1920x1080解像度基準でアライメント
             gaze_x_sync, gaze_y_sync = align_gaze_to_screen(df_gaze, SCREEN_WIDTH, SCREEN_HEIGHT)
             ax.plot(gaze_x_sync, gaze_y_sync, color=color, linestyle=':', alpha=0.15, linewidth=0.8, label='視線軌跡 (画面マッピング)')
             
-            # イベントプロット
             df_add = df_log[df_log['tag'] == 'add'].dropna(subset=['x_num', 'y_num'])
             ax.scatter(df_add['x_num'], df_add['y_num'], color='red', marker='*', s=150, zorder=5, label='Add')
             df_open = df_log[df_log['tag'] == 'open_modal'].dropna(subset=['x_num', 'y_num'])
             ax.scatter(df_open['x_num'], df_open['y_num'], color='purple', marker='o', s=60, zorder=4, label='Open')
             
-            # 描画表示範囲を1920x1080画面に固定し、Y軸を反転（左上が0,0）
             ax.set_xlim(0, SCREEN_WIDTH)
             ax.set_ylim(SCREEN_HEIGHT, 0)
             
@@ -420,7 +443,6 @@ class EyeTrackingDashboard:
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
 
     def draw_tab5(self):
-        """タブ5: 軌跡リプレイ (画面サイズに合わせた動的リプレイ)"""
         num_plots = len(self.loaded_dfs)
         fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 6))
         fig.subplots_adjust(bottom=0.25)
@@ -449,12 +471,10 @@ class EyeTrackingDashboard:
             gaze_work = df_gaze[(df_gaze['Time'] >= start_ts) & (df_gaze['Time'] <= order_ts)].copy()
             gaze_work['time_sec'] = (gaze_work['Time'] - start_ts) / 1000.0
             
-            # リプレイ用にも解像度基準アライメントを適用
             gx_sync, gy_sync = align_gaze_to_screen(gaze_work, SCREEN_WIDTH, SCREEN_HEIGHT)
             gaze_work['gaze_x_px'] = gx_sync
             gaze_work['gaze_y_px'] = gy_sync
             
-            # 描画表示範囲を1920x1080画面に固定し、Y軸を反転（左上が0,0）
             ax.set_xlim(0, SCREEN_WIDTH)
             ax.set_ylim(SCREEN_HEIGHT, 0)
             
@@ -487,7 +507,6 @@ class EyeTrackingDashboard:
                 elements['lines'].clear()
                 elements['scatters'].clear()
                 
-                # マウス描画
                 mask_log = (log_df['time_sec'] >= t_min) & (log_df['time_sec'] <= t_max)
                 cur_log = log_df[mask_log]
                 cur_mouse = cur_log[cur_log['tag'] == 'mouse_move'].dropna(subset=['x_num', 'y_num'])
@@ -496,7 +515,6 @@ class EyeTrackingDashboard:
                     l_mouse, = ax.plot(cur_mouse['x_num'], cur_mouse['y_num'], color=c, alpha=0.8, linewidth=2, label='Mouse')
                     elements['lines'].append(l_mouse)
 
-                # 視線描画 (薄い点線)
                 mask_gaze = (gaze_df['time_sec'] >= t_min) & (gaze_df['time_sec'] <= t_max)
                 cur_gaze = gaze_df[mask_gaze].dropna(subset=['gaze_x_px', 'gaze_y_px'])
                 
@@ -504,7 +522,6 @@ class EyeTrackingDashboard:
                     l_gaze, = ax.plot(cur_gaze['gaze_x_px'], cur_gaze['gaze_y_px'], color=c, linestyle=':', alpha=0.4, linewidth=1.5, label='Gaze')
                     elements['lines'].append(l_gaze)
                     
-                # イベントマーク
                 cur_add = cur_log[cur_log['tag'] == 'add'].dropna(subset=['x_num', 'y_num'])
                 if not cur_add.empty:
                     sc = ax.scatter(cur_add['x_num'], cur_add['y_num'], color='red', marker='*', s=200, zorder=5)
@@ -522,6 +539,54 @@ class EyeTrackingDashboard:
         update_plot((init_min, init_max))
 
         canvas = FigureCanvasTkAgg(fig, master=self.tab5)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
+
+    def draw_tab6(self):
+        """新タブ⑥: 総所要時間と個別サブタスク時間のグラフ比較"""
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        
+        labels = []
+        total_times = []
+        colors = []
+        
+        for i, (df_log, df_gaze, label, color, ui_type) in enumerate(self.loaded_dfs):
+            total_time, subtask_durs = calculate_task_durations(df_log)
+            labels.append(label)
+            total_times.append(total_time)
+            colors.append(color)
+            
+            # 右側：個別追加時間の推移（折れ線）
+            trials = np.arange(1, len(subtask_durs) + 1)
+            ax2.plot(trials, subtask_durs, marker='o', linewidth=2.5, color=color, label=f"{label}")
+            
+        # 左側：全体タスク総所要時間の比較（棒グラフ）
+        bars = ax1.bar(labels, total_times, color=colors, alpha=0.8, width=0.4)
+        ax1.set_title("全体タスクの総所要時間", fontsize=11, fontweight='bold')
+        ax1.set_ylabel("総完了時間 (秒)")
+        ax1.grid(True, alpha=0.3, axis='y')
+        
+        # 棒グラフの上に値をラベル表示
+        for bar in bars:
+            height = bar.get_height()
+            ax1.annotate(f'{height:.2f}s',
+                        xy=(bar.get_x() + bar.get_width() / 2, height),
+                        xytext=(0, 3),  # 縦方向に3ポイントずらす
+                        textcoords="offset points",
+                        ha='center', va='bottom', fontsize=9, fontweight='bold')
+                        
+        # 右側：グラフの装飾
+        ax2.set_title("個別商品の追加所要時間\n(モーダル展開 から カート追加 まで)", fontsize=11, fontweight='bold')
+        ax2.set_xlabel("試行回数 (商品目)")
+        ax2.set_ylabel("所要時間 (秒)")
+        # データの最大要素数に合わせてx軸の目盛りを設定（大抵9〜10回分）
+        max_len = max([len(calculate_task_durations(df)[1]) for df, _, _, _, _ in self.loaded_dfs], default=10)
+        ax2.set_xticks(np.arange(1, max_len + 1))
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+        
+        plt.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=self.tab6)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
 
