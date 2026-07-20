@@ -1,6 +1,7 @@
 import os
 import re
 import math
+import ast
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
@@ -19,6 +20,7 @@ plt.rcParams['font.sans-serif'] = ['Hiragino Maru Gothic Pro', 'Yu Gothic', 'Mei
 COLORS = ['#2ca02c', '#ff7f0e', '#1f77b4']
 SCREEN_WIDTH = 1920
 SCREEN_HEIGHT = 1080
+MAX_BLINK_SEC = 0.5 # 瞬きと判定する最大欠損時間(秒)
 
 # ==========================================
 # データ処理関数
@@ -85,15 +87,6 @@ def extract_all_pupil_trajectories(df_log, df_gaze, tag='add'):
             trajectories.append(binned.set_index('bin')['LeftPupil'])
     return trajectories
 
-def calculate_gaze_stability(df_log, df_gaze, tag='add'):
-    events = df_log[df_log['tag'] == tag]['timestamp'].values
-    stds = []
-    for ts in events:
-        window = df_gaze[(df_gaze['Time'] >= ts - 1500) & (df_gaze['Time'] < ts)]
-        if not window.empty and not window['LeftGazeX'].dropna().empty:
-            stds.append(window['LeftGazeX'].std())
-    return np.nanmean(stds) if stds else np.nan
-
 def align_gaze_to_screen(df_gaze, screen_width=1920, screen_height=1080):
     gaze_x = df_gaze['LeftGazeX']
     gaze_y = df_gaze['LeftGazeY']
@@ -110,7 +103,6 @@ def align_gaze_to_screen(df_gaze, screen_width=1920, screen_height=1080):
     return gaze_x_aligned, gaze_y_aligned
 
 def calculate_mouse_ratio(df_subset):
-    """迂回比率（実移動距離 / 直線距離）を計算"""
     df_moves = df_subset[df_subset['tag'] == 'mouse_move'].dropna(subset=['x_num', 'y_num'])
     if len(df_moves) < 2: return np.nan, 0
     dx, dy = df_moves['x_num'].diff(), df_moves['y_num'].diff()
@@ -122,7 +114,6 @@ def calculate_mouse_ratio(df_subset):
     return actual_dist / straight_dist, actual_dist
 
 def analyze_mouse_hesitation(df_log):
-    """全体およびサブタスク（Open→Add）のマウス迂回比率を分析"""
     df_log['x_num'] = pd.to_numeric(df_log['x'], errors='coerce')
     df_log['y_num'] = pd.to_numeric(df_log['y'], errors='coerce')
     
@@ -137,15 +128,17 @@ def analyze_mouse_hesitation(df_log):
     total_ratio, total_dist = calculate_mouse_ratio(df_log[total_mask])
     
     subtask_ratios = []
-    open_ts = None
+    close_ts = None
     df_filtered = df_log[total_mask].sort_values('timestamp')
     for _, row in df_filtered.iterrows():
-        if row['tag'] == 'open_modal': open_ts = row['timestamp']
-        elif row['tag'] == 'add' and open_ts is not None:
-            sub_mask = (df_log['timestamp'] >= open_ts) & (df_log['timestamp'] <= row['timestamp'])
+        if row['tag'] == 'close_modal': 
+            close_ts = row['timestamp']
+        elif row['tag'] == 'open_modal' and close_ts is not None:
+            sub_mask = (df_log['timestamp'] >= close_ts) & (df_log['timestamp'] <= row['timestamp'])
             ratio, _ = calculate_mouse_ratio(df_log[sub_mask])
-            subtask_ratios.append(ratio)
-            open_ts = None
+            if not np.isnan(ratio):
+                subtask_ratios.append(ratio)
+            close_ts = None
             
     avg_subtask_ratio = np.nanmean(subtask_ratios) if subtask_ratios else 1.0
     return total_dist, total_ratio, avg_subtask_ratio
@@ -153,19 +146,95 @@ def analyze_mouse_hesitation(df_log):
 def calculate_task_durations(df_log):
     start_row = df_log[df_log['tag'] == 'start']
     order_row = df_log[df_log['tag'] == 'order']
-    if start_row.empty: return 0, []
+    if start_row.empty: return 0, [], []
     start_ts = start_row['timestamp'].values[0]
     order_ts = order_row['timestamp'].values[0] if not order_row.empty else df_log['timestamp'].max()
     total_time = (order_ts - start_ts) / 1000.0
-    subtask_durations = []
+    
+    open_to_add_durations = []
+    close_to_open_durations = []
+    
     open_ts = None
+    close_ts = None
+    
     df_filtered = df_log[(df_log['timestamp'] >= start_ts) & (df_log['timestamp'] <= order_ts)].sort_values('timestamp')
     for _, row in df_filtered.iterrows():
-        if row['tag'] == 'open_modal': open_ts = row['timestamp']
+        if row['tag'] == 'close_modal':
+            close_ts = row['timestamp']
+        elif row['tag'] == 'open_modal':
+            open_ts = row['timestamp']
+            if close_ts is not None:
+                close_to_open_durations.append((row['timestamp'] - close_ts) / 1000.0)
+                close_ts = None
         elif row['tag'] == 'add' and open_ts is not None:
-            subtask_durations.append((row['timestamp'] - open_ts) / 1000.0)
+            open_to_add_durations.append((row['timestamp'] - open_ts) / 1000.0)
             open_ts = None
-    return total_time, subtask_durations
+            
+    return total_time, open_to_add_durations, close_to_open_durations
+
+def get_item_id(row):
+    """行データから商品IDっぽい文字列を抽出する（失敗時はメッセージ全体を返す）"""
+    if 'target' in row and pd.notna(row['target']) and str(row['target']).strip() != '':
+        return str(row['target']).strip()
+        
+    msg = row.get('message', '')
+    if pd.isna(msg) or str(msg).strip() == '': 
+        return "UNKNOWN"
+        
+    msg_str = str(msg).strip()
+    try:
+        if '{' in msg_str:
+            d = ast.literal_eval(msg_str)
+            if isinstance(d, dict):
+                for key in ['id', 'item_id', 'target', 'product_id', 'name', 'item']:
+                    if key in d: return str(d[key])
+    except: pass
+    
+    m = re.search(r'(?:id|item_id|target|product_id|name|item)\s*[:=]\s*[\'"]?([a-zA-Z0-9_-]+)[\'"]?', msg_str, re.IGNORECASE)
+    if m: return m.group(1).strip()
+    
+    # 抽出できなかった場合はメッセージ全体をフォールバックとして返す（同じ商品ならメッセージも同じはず）
+    return msg_str
+
+def analyze_same_vs_diff_duration(df_log):
+    """【修正】addが押されたタイミングで、前回のaddと同じ商品かどうかを判定する"""
+    durations_same, durations_diff = [], []
+    if 'tag' not in df_log.columns: return [], []
+    
+    last_close_ts = None
+    pending_duration = None
+    prev_item_id = None
+    
+    for _, row in df_log.sort_values('timestamp').iterrows():
+        tag = row['tag']
+        
+        if tag == 'close_modal':
+            # モーダルが閉じた時間を記録
+            last_close_ts = row['timestamp']
+            
+        elif tag == 'open_modal':
+            # モーダルが開いた時、Close->Openの時間を計算して保持（まだ商品はわからない）
+            if last_close_ts is not None:
+                pending_duration = (row['timestamp'] - last_close_ts) / 1000.0
+            last_close_ts = None
+            
+        elif tag == 'add':
+            # addが押された時点で商品が確定する
+            item_id = get_item_id(row)
+            
+            if pending_duration is not None and prev_item_id is not None and item_id != "UNKNOWN":
+                if item_id == prev_item_id:
+                    durations_same.append(pending_duration)
+                else:
+                    durations_diff.append(pending_duration)
+            
+            if item_id != "UNKNOWN":
+                prev_item_id = item_id
+                
+            # 計算が終わったのでリセット
+            pending_duration = None
+
+    return durations_same, durations_diff
 
 def calculate_phase_gaze_stability(df_log, df_gaze, phase_tag, duration_ms=1000):
     events = df_log[df_log['tag'] == phase_tag]['timestamp'].values
@@ -227,8 +296,9 @@ class EyeTrackingDashboard:
         self.right_frame = tk.Frame(self.root)
         self.right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
         self.tab_control = ttk.Notebook(self.right_frame)
-        self.tabs = [ttk.Frame(self.tab_control) for _ in range(8)]
-        tab_names = ["①瞳孔(平均)", "②瞳孔(分布)", "③タイムライン", "④2D全体軌跡", "⑤動的リプレイ", "⑥所要時間", "⑦局面別視線", "⑧マウス迷い"]
+        
+        tab_names = ["①瞳孔(平均)", "②瞳孔(分布)", "③タイムライン", "④2D全体軌跡", "⑤動的リプレイ", "⑥所要時間", "⑦局面別視線", "⑧マウス迷い", "⑨連続注文(同/異)"]
+        self.tabs = [ttk.Frame(self.tab_control) for _ in range(len(tab_names))]
         for i, name in enumerate(tab_names): self.tab_control.add(self.tabs[i], text=f" {name} ")
         self.tab_control.pack(expand=1, fill="both")
 
@@ -266,10 +336,10 @@ class EyeTrackingDashboard:
             except Exception as e: messagebox.showerror("エラー", f"ロード失敗: {log_f}\n{e}")
                 
         if self.loaded_dfs:
-            methods = [self.draw_tab1, self.draw_tab2, self.draw_tab3, self.draw_tab4, self.draw_tab5, self.draw_tab6, self.draw_tab7, self.draw_tab8]
+            methods = [self.draw_tab1, self.draw_tab2, self.draw_tab3, self.draw_tab4, 
+                       self.draw_tab5, self.draw_tab6, self.draw_tab7, self.draw_tab8, self.draw_tab9]
             for m in methods: m()
 
-    # --- タブ描画関数 ---
     def draw_tab1(self):
         fig, ax = plt.subplots(figsize=(8, 5))
         for df_log, df_gaze, label, color, _ in self.loaded_dfs:
@@ -301,11 +371,38 @@ class EyeTrackingDashboard:
             ots = df_log[df_log['tag'] == 'order']['timestamp'].values[0] if not df_log[df_log['tag'] == 'order'].empty else df_log['timestamp'].max()
             d_gaze = df_gaze[(df_gaze['Time'] >= sts) & (df_gaze['Time'] <= ots)]
             is_nan = d_gaze['LeftPupil'].isna()
-            axes[i].plot((d_gaze['Time'] - sts) / 1000.0, d_gaze['LeftPupil'], color=color, alpha=0.6)
-            axes[i].set_title(f"{label} | 瞬き: {(is_nan & ~is_nan.shift(1, fill_value=False)).sum()}回", fontweight='bold')
+            time_secs = (d_gaze['Time'] - sts) / 1000.0
+            
+            axes[i].plot(time_secs, d_gaze['LeftPupil'], color=color, alpha=0.6)
+            
+            is_nan_arr = is_nan.values
+            times_arr = time_secs.values
+            start_idx = None
+            blink_plotted = False
+            blinks = []
+
+            for j, isnan_val in enumerate(is_nan_arr):
+                if isnan_val and start_idx is None:
+                    start_idx = j
+                elif not isnan_val and start_idx is not None:
+                    duration = times_arr[j-1] - times_arr[start_idx]
+                    if duration <= MAX_BLINK_SEC: blinks.append((start_idx, j-1))
+                    start_idx = None
+
+            if start_idx is not None:
+                duration = times_arr[-1] - times_arr[start_idx]
+                if duration <= MAX_BLINK_SEC: blinks.append((start_idx, len(times_arr)-1))
+
+            for b_start, b_end in blinks:
+                axes[i].axvspan(times_arr[b_start], times_arr[b_end], color='red', alpha=0.3, lw=0, label='瞬き' if not blink_plotted else "")
+                blink_plotted = True
+
+            axes[i].set_title(f"{label} | 瞬き: {len(blinks)}回 (≦{MAX_BLINK_SEC}秒)", fontweight='bold')
             for _, r in df_log[(df_log['timestamp'] >= sts) & (df_log['timestamp'] <= ots)].iterrows():
                 if r['tag'] in ['add', 'open_modal']: axes[i].axvline((r['timestamp'] - sts)/1000, color='blue' if r['tag']=='add' else 'purple', alpha=0.5)
             axes[i].grid(True, alpha=0.2)
+            if blink_plotted: axes[i].legend(loc='upper right')
+            
         plt.tight_layout(); FigureCanvasTkAgg(fig, master=self.tabs[2]).get_tk_widget().pack(fill=tk.BOTH, expand=1)
 
     def draw_tab4(self):
@@ -357,59 +454,10 @@ class EyeTrackingDashboard:
             axes[i].set_title(f"{label} (動的リプレイ)", fontsize=11, fontweight='bold')
             axes[i].grid(True, alpha=0.2)
             
-            self.processed_data.append({
-                'ax': axes[i], 'log': log_work, 'gaze': gaze_work, 'color': color
-            })
+            self.processed_data.append({'ax': axes[i], 'log': log_work, 'gaze': gaze_work, 'color': color})
             self.plot_elements.append({'lines': [], 'scatters': []})
 
         if max_duration == 0: return
-
-        slider_ax = fig.add_axes([0.15, 0.05, 0.7, 0.05])
-        range_slider = RangeSlider(slider_ax, "表示時間(秒)", 0, max_duration, valinit=(0, min(10.0, max_duration)), color='#1f77b4')
-
-    def draw_tab5(self):
-        num_plots = len(self.loaded_dfs)
-        fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 6))
-        fig.subplots_adjust(bottom=0.25)
-        if num_plots == 1: axes = [axes]
-        
-        self.plot_elements = [] 
-        max_duration = 0 
-        self.processed_data = []
-        
-        for i, (df_log, df_gaze, label, color, _) in enumerate(self.loaded_dfs):
-            start_row = df_log[df_log['tag'] == 'start']
-            if start_row.empty: continue
-            
-            start_ts = start_row['timestamp'].values[0]
-            order_ts = df_log[df_log['tag'] == 'order']['timestamp'].values[0] if not df_log[df_log['tag'] == 'order'].empty else df_log['timestamp'].max()
-            duration = (order_ts - start_ts) / 1000.0
-            max_duration = max(max_duration, duration)
-            
-            log_work = df_log[(df_log['timestamp'] >= start_ts) & (df_log['timestamp'] <= order_ts)].copy()
-            log_work['time_sec'] = (log_work['timestamp'] - start_ts) / 1000.0
-            log_work['x_num'] = pd.to_numeric(log_work['x'], errors='coerce')
-            log_work['y_num'] = pd.to_numeric(log_work['y'], errors='coerce')
-            
-            gaze_work = df_gaze[(df_gaze['Time'] >= start_ts) & (df_gaze['Time'] <= order_ts)].copy()
-            gaze_work['time_sec'] = (gaze_work['Time'] - start_ts) / 1000.0
-            
-            gx_sync, gy_sync = align_gaze_to_screen(gaze_work, SCREEN_WIDTH, SCREEN_HEIGHT)
-            gaze_work['gaze_x_px'] = gx_sync
-            gaze_work['gaze_y_px'] = gy_sync
-            
-            axes[i].set_xlim(0, SCREEN_WIDTH)
-            axes[i].set_ylim(SCREEN_HEIGHT, 0)
-            axes[i].set_title(f"{label} (動的リプレイ)", fontsize=11, fontweight='bold')
-            axes[i].grid(True, alpha=0.2)
-            
-            self.processed_data.append({
-                'ax': axes[i], 'log': log_work, 'gaze': gaze_work, 'color': color
-            })
-            self.plot_elements.append({'lines': [], 'scatters': []})
-
-        if max_duration == 0: return
-
         slider_ax = fig.add_axes([0.15, 0.05, 0.7, 0.05])
         range_slider = RangeSlider(slider_ax, "表示時間(秒)", 0, max_duration, valinit=(0, min(10.0, max_duration)), color='#1f77b4')
 
@@ -422,13 +470,11 @@ class EyeTrackingDashboard:
                 c = data['color']
                 elements = self.plot_elements[i]
                 
-                # 描画要素のクリア
                 for l in elements['lines']: l.remove()
                 for s in elements['scatters']: s.remove()
                 elements['lines'].clear()
                 elements['scatters'].clear()
                 
-                # マウス軌跡の描画
                 mask_log = (log_df['time_sec'] >= t_min) & (log_df['time_sec'] <= t_max)
                 cur_log = log_df[mask_log]
                 cur_mouse = cur_log[cur_log['tag'] == 'mouse_move'].dropna(subset=['x_num', 'y_num'])
@@ -437,7 +483,6 @@ class EyeTrackingDashboard:
                     l_mouse, = ax.plot(cur_mouse['x_num'], cur_mouse['y_num'], color=c, alpha=0.8, linewidth=2, label='Mouse')
                     elements['lines'].append(l_mouse)
 
-                # 視線軌跡の描画
                 mask_gaze = (gaze_df['time_sec'] >= t_min) & (gaze_df['time_sec'] <= t_max)
                 cur_gaze = gaze_df[mask_gaze].dropna(subset=['gaze_x_px', 'gaze_y_px'])
                 
@@ -445,8 +490,6 @@ class EyeTrackingDashboard:
                     l_gaze, = ax.plot(cur_gaze['gaze_x_px'], cur_gaze['gaze_y_px'], color=c, linestyle=':', alpha=0.4, linewidth=1.5, label='Gaze')
                     elements['lines'].append(l_gaze)
                     
-                # 【修正箇所】イベントマーカー（add, open_modal）の再描画
-                # スライダーの範囲内（t_min ~ t_max）に発生したイベントだけをプロットする
                 cur_add = cur_log[cur_log['tag'] == 'add'].dropna(subset=['x_num', 'y_num'])
                 if not cur_add.empty:
                     sc = ax.scatter(cur_add['x_num'], cur_add['y_num'], color='red', marker='*', s=200, zorder=5)
@@ -462,20 +505,23 @@ class EyeTrackingDashboard:
         range_slider.on_changed(update_plot)
         self.sliders.append(range_slider)
         update_plot((0, min(10.0, max_duration)))
-
         canvas = FigureCanvasTkAgg(fig, master=self.tabs[4])
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
-        
+
     def draw_tab6(self):
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 5))
         for df_log, df_gaze, label, color, _ in self.loaded_dfs:
-            tot, subs = calculate_task_durations(df_log)
+            tot, subs_add, subs_close = calculate_task_durations(df_log)
             bar = ax1.bar(label, tot, color=color, alpha=0.8, width=0.4)
             ax1.annotate(f'{tot:.2f}s', xy=(bar[0].get_x() + bar[0].get_width()/2, tot), xytext=(0,3), textcoords="offset points", ha='center', va='bottom', fontweight='bold')
-            ax2.plot(np.arange(1, len(subs)+1), subs, marker='o', lw=2.5, color=color, label=label)
-        ax1.set_title("全体タスク総所要時間", fontweight='bold'); ax2.set_title("個別(Open→Add)所要時間", fontweight='bold')
+            if subs_add: ax2.plot(np.arange(1, len(subs_add)+1), subs_add, marker='o', lw=2.5, color=color, label=label)
+            if subs_close: ax3.plot(np.arange(1, len(subs_close)+1), subs_close, marker='s', lw=2.5, color=color, linestyle='--', label=label)
+        ax1.set_title("全体タスク総所要時間", fontweight='bold')
+        ax2.set_title("個別(Open→Add)所要時間", fontweight='bold')
+        ax3.set_title("個別(Close→Open)所要時間", fontweight='bold')
         ax1.grid(True, alpha=0.3, axis='y'); ax2.grid(True, alpha=0.3); ax2.legend()
+        ax3.grid(True, alpha=0.3); ax3.legend()
         plt.tight_layout(); FigureCanvasTkAgg(fig, master=self.tabs[5]).get_tk_widget().pack(fill=tk.BOTH, expand=1)
 
     def draw_tab7(self):
@@ -492,32 +538,73 @@ class EyeTrackingDashboard:
         plt.tight_layout(); FigureCanvasTkAgg(fig, master=self.tabs[6]).get_tk_widget().pack(fill=tk.BOTH, expand=1)
 
     def draw_tab8(self):
-        """新タブ⑧: マウス迂回比率（迷い）分析"""
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
         for df_log, df_gaze, label, color, _ in self.loaded_dfs:
             _, tot_ratio, sub_ratio = analyze_mouse_hesitation(df_log)
             
-            # 全体比率
             b1 = ax1.bar(label, tot_ratio, color=color, alpha=0.8, width=0.4)
             ax1.annotate(f'{tot_ratio:.1f}倍', xy=(b1[0].get_x()+b1[0].get_width()/2, tot_ratio), xytext=(0,3), textcoords="offset points", ha='center', va='bottom', fontweight='bold')
             
-            # 個別比率
             b2 = ax2.bar(label, sub_ratio, color=color, alpha=0.8, width=0.4)
             ax2.annotate(f'{sub_ratio:.1f}倍', xy=(b2[0].get_x()+b2[0].get_width()/2, sub_ratio), xytext=(0,3), textcoords="offset points", ha='center', va='bottom', fontweight='bold')
 
         ax1.set_title("全体の迂回比率\n※高いほどタスク間の次への準備（徘徊）が多い", fontweight='bold')
-        ax2.set_title("個別操作(Open→Add)の平均迂回比率\n※高いほどターゲットを探して迷っている", fontweight='bold')
+        ax2.set_title("個別操作(Close→Open)の平均迂回比率\n※高いほどターゲットを探して迷っている", fontweight='bold')
         ax1.set_ylabel("実移動距離 / 直線距離")
         ax1.grid(True, alpha=0.3, axis='y'); ax2.grid(True, alpha=0.3, axis='y')
         
-        # コメント
-        fig.text(0.5, 0.02, "【考察】viewは個別操作での迷いが最も少ない(1.9倍)ですが、全体では一番高く(15.5倍)なります。これは次への予測・待機行動がスムーズに行えている証拠です。", ha='center', fontsize=10, bbox=dict(facecolor='white', alpha=0.8, boxstyle='round,pad=0.5'))
-        
         plt.tight_layout()
-        plt.subplots_adjust(bottom=0.15)
         canvas = FigureCanvasTkAgg(fig, master=self.tabs[7])
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
+
+    def draw_tab9(self):
+        fig, ax = plt.subplots(figsize=(10, 5))
+        
+        labels = []
+        same_means = []
+        diff_means = []
+        
+        for df_log, df_gaze, label, color, _ in self.loaded_dfs:
+            same_d, diff_d = analyze_same_vs_diff_duration(df_log)
+            
+            same_mean = np.mean(same_d) if len(same_d) > 0 else 0
+            diff_mean = np.mean(diff_d) if len(diff_d) > 0 else 0
+            
+            labels.append(label)
+            same_means.append(same_mean)
+            diff_means.append(diff_mean)
+        
+        x = np.arange(len(labels))
+        width = 0.35
+        
+        rects1 = ax.bar(x - width/2, same_means, width, label='直前と同じ商品', color='#1f77b4', alpha=0.8)
+        rects2 = ax.bar(x + width/2, diff_means, width, label='異なる商品', color='#ff7f0e', alpha=0.8)
+        
+        ax.set_ylabel('平均所要時間 (Close→Open) [秒]')
+        ax.set_title('注文の連続性による商品探索時間 (Close→Open) の違い', fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels)
+        ax.legend()
+        ax.grid(True, alpha=0.3, axis='y')
+        
+        def autolabel(rects):
+            for rect in rects:
+                height = rect.get_height()
+                if height > 0:
+                    ax.annotate(f'{height:.2f}s',
+                                xy=(rect.get_x() + rect.get_width() / 2, height),
+                                xytext=(0, 3), 
+                                textcoords="offset points",
+                                ha='center', va='bottom', fontweight='bold')
+        autolabel(rects1)
+        autolabel(rects2)
+        
+        fig.text(0.5, 0.02, "【考察】同じ商品を連続して選ぶ場合、すでに場所を把握しているため探索時間が短くなる傾向（学習効果）が確認できます。", ha='center', fontsize=10, bbox=dict(facecolor='white', alpha=0.8, boxstyle='round,pad=0.5'))
+        
+        plt.tight_layout()
+        plt.subplots_adjust(bottom=0.15)
+        FigureCanvasTkAgg(fig, master=self.tabs[8]).get_tk_widget().pack(fill=tk.BOTH, expand=1)
 
 if __name__ == "__main__":
     root = tk.Tk()
