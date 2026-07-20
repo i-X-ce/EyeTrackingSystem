@@ -173,7 +173,6 @@ def calculate_task_durations(df_log):
     return total_time, open_to_add_durations, close_to_open_durations
 
 def get_item_id(row):
-    """行データから商品IDっぽい文字列を抽出する（失敗時はメッセージ全体を返す）"""
     if 'target' in row and pd.notna(row['target']) and str(row['target']).strip() != '':
         return str(row['target']).strip()
         
@@ -193,11 +192,9 @@ def get_item_id(row):
     m = re.search(r'(?:id|item_id|target|product_id|name|item)\s*[:=]\s*[\'"]?([a-zA-Z0-9_-]+)[\'"]?', msg_str, re.IGNORECASE)
     if m: return m.group(1).strip()
     
-    # 抽出できなかった場合はメッセージ全体をフォールバックとして返す（同じ商品ならメッセージも同じはず）
     return msg_str
 
 def analyze_same_vs_diff_duration(df_log):
-    """【修正】addが押されたタイミングで、前回のaddと同じ商品かどうかを判定する"""
     durations_same, durations_diff = [], []
     if 'tag' not in df_log.columns: return [], []
     
@@ -209,17 +206,14 @@ def analyze_same_vs_diff_duration(df_log):
         tag = row['tag']
         
         if tag == 'close_modal':
-            # モーダルが閉じた時間を記録
             last_close_ts = row['timestamp']
             
         elif tag == 'open_modal':
-            # モーダルが開いた時、Close->Openの時間を計算して保持（まだ商品はわからない）
             if last_close_ts is not None:
                 pending_duration = (row['timestamp'] - last_close_ts) / 1000.0
             last_close_ts = None
             
         elif tag == 'add':
-            # addが押された時点で商品が確定する
             item_id = get_item_id(row)
             
             if pending_duration is not None and prev_item_id is not None and item_id != "UNKNOWN":
@@ -231,7 +225,6 @@ def analyze_same_vs_diff_duration(df_log):
             if item_id != "UNKNOWN":
                 prev_item_id = item_id
                 
-            # 計算が終わったのでリセット
             pending_duration = None
 
     return durations_same, durations_diff
@@ -340,6 +333,39 @@ class EyeTrackingDashboard:
                        self.draw_tab5, self.draw_tab6, self.draw_tab7, self.draw_tab8, self.draw_tab9]
             for m in methods: m()
 
+    # --- 保存ボタン付き描画共通メソッド ---
+    def embed_figure(self, fig, tab_index, default_filename="plot.png"):
+        tab_frame = self.tabs[tab_index]
+        
+        # ボタン用フレーム
+        btn_frame = tk.Frame(tab_frame)
+        btn_frame.pack(side=tk.TOP, fill=tk.X)
+        
+        def save_image():
+            filepath = filedialog.asksaveasfilename(
+                initialfile=default_filename,
+                defaultextension=".png",
+                filetypes=[("PNG Image", "*.png"), ("JPEG Image", "*.jpg"), ("PDF Document", "*.pdf")]
+            )
+            if filepath:
+                try:
+                    # dpi=300で高画質、bbox_inches='tight'で余白の自動カット
+                    fig.savefig(filepath, dpi=300, bbox_inches='tight', facecolor='white')
+                    messagebox.showinfo("保存完了", f"画像を保存しました:\n{filepath}")
+                except Exception as e:
+                    messagebox.showerror("エラー", f"画像の保存に失敗しました:\n{e}")
+
+        # 右上に保存ボタンを配置
+        btn = tk.Button(btn_frame, text="📸 画像として保存", command=save_image, font=("", 10, "bold"), bg="#2196F3", fg="white")
+        btn.pack(side=tk.RIGHT, padx=10, pady=5)
+        
+        # Canvasの描画
+        canvas = FigureCanvasTkAgg(fig, master=tab_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(side=tk.BOTTOM, fill=tk.BOTH, expand=1)
+        return canvas
+
+    # --- タブ描画関数 ---
     def draw_tab1(self):
         fig, ax = plt.subplots(figsize=(8, 5))
         for df_log, df_gaze, label, color, _ in self.loaded_dfs:
@@ -348,7 +374,7 @@ class EyeTrackingDashboard:
         ax.axvline(x=0, color='red', linestyle='--', alpha=0.6, label='add(0ms)')
         ax.set_title("【add】瞳孔径の推移 (平均値)", fontweight='bold')
         ax.legend(); ax.grid(True, alpha=0.3)
-        FigureCanvasTkAgg(fig, master=self.tabs[0]).get_tk_widget().pack(fill=tk.BOTH, expand=1)
+        self.embed_figure(fig, 0, "01_pupil_mean.png")
 
     def draw_tab2(self):
         fig, axes = plt.subplots(1, len(self.loaded_dfs), figsize=(6 * len(self.loaded_dfs), 5), sharey=True)
@@ -359,7 +385,8 @@ class EyeTrackingDashboard:
                 for traj in trajectories: axes[i].plot(traj.index, traj.values, color=color, alpha=0.15)
                 axes[i].plot(pd.concat(trajectories, axis=1).mean(axis=1).index, pd.concat(trajectories, axis=1).mean(axis=1).values, color='black', marker='o', linewidth=3)
             axes[i].set_title(label, fontweight='bold'); axes[i].grid(True, alpha=0.3)
-        plt.tight_layout(); FigureCanvasTkAgg(fig, master=self.tabs[1]).get_tk_widget().pack(fill=tk.BOTH, expand=1)
+        plt.tight_layout()
+        self.embed_figure(fig, 1, "02_pupil_dist.png")
 
     def draw_tab3(self):
         fig, axes = plt.subplots(len(self.loaded_dfs), 1, figsize=(10, 2.5 * len(self.loaded_dfs)), sharex=True)
@@ -403,7 +430,8 @@ class EyeTrackingDashboard:
             axes[i].grid(True, alpha=0.2)
             if blink_plotted: axes[i].legend(loc='upper right')
             
-        plt.tight_layout(); FigureCanvasTkAgg(fig, master=self.tabs[2]).get_tk_widget().pack(fill=tk.BOTH, expand=1)
+        plt.tight_layout()
+        self.embed_figure(fig, 2, "03_timeline.png")
 
     def draw_tab4(self):
         fig, axes = plt.subplots(1, len(self.loaded_dfs), figsize=(6 * len(self.loaded_dfs), 6))
@@ -416,7 +444,8 @@ class EyeTrackingDashboard:
             axes[i].plot(gx, gy, color=color, linestyle=':', alpha=0.15)
             axes[i].set_xlim(0, SCREEN_WIDTH); axes[i].set_ylim(SCREEN_HEIGHT, 0)
             axes[i].set_title(label, fontweight='bold'); axes[i].grid(True, alpha=0.2)
-        plt.tight_layout(); FigureCanvasTkAgg(fig, master=self.tabs[3]).get_tk_widget().pack(fill=tk.BOTH, expand=1)
+        plt.tight_layout()
+        self.embed_figure(fig, 3, "04_2d_trajectory.png")
 
     def draw_tab5(self):
         num_plots = len(self.loaded_dfs)
@@ -504,10 +533,10 @@ class EyeTrackingDashboard:
 
         range_slider.on_changed(update_plot)
         self.sliders.append(range_slider)
+        
+        # 描画＆ボタン追加（スライダーの状態もそのまま保存されます）
+        self.embed_figure(fig, 4, "05_dynamic_replay.png")
         update_plot((0, min(10.0, max_duration)))
-        canvas = FigureCanvasTkAgg(fig, master=self.tabs[4])
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
 
     def draw_tab6(self):
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 5))
@@ -522,7 +551,8 @@ class EyeTrackingDashboard:
         ax3.set_title("個別(Close→Open)所要時間", fontweight='bold')
         ax1.grid(True, alpha=0.3, axis='y'); ax2.grid(True, alpha=0.3); ax2.legend()
         ax3.grid(True, alpha=0.3); ax3.legend()
-        plt.tight_layout(); FigureCanvasTkAgg(fig, master=self.tabs[5]).get_tk_widget().pack(fill=tk.BOTH, expand=1)
+        plt.tight_layout()
+        self.embed_figure(fig, 5, "06_task_duration.png")
 
     def draw_tab7(self):
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
@@ -535,7 +565,8 @@ class EyeTrackingDashboard:
             ax2.annotate(f'{cx:.1f}px', xy=(b2[0].get_x()+b2[0].get_width()/2, cx), xytext=(0,3), textcoords="offset points", ha='center', va='bottom', fontweight='bold')
         ax1.set_title("Open直後1秒間の視線ブレ(X軸)", fontweight='bold'); ax2.set_title("Close直後1秒間の視線ブレ(X軸)", fontweight='bold')
         ax1.grid(True, alpha=0.3, axis='y'); ax2.grid(True, alpha=0.3, axis='y')
-        plt.tight_layout(); FigureCanvasTkAgg(fig, master=self.tabs[6]).get_tk_widget().pack(fill=tk.BOTH, expand=1)
+        plt.tight_layout()
+        self.embed_figure(fig, 6, "07_gaze_stability.png")
 
     def draw_tab8(self):
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
@@ -554,9 +585,7 @@ class EyeTrackingDashboard:
         ax1.grid(True, alpha=0.3, axis='y'); ax2.grid(True, alpha=0.3, axis='y')
         
         plt.tight_layout()
-        canvas = FigureCanvasTkAgg(fig, master=self.tabs[7])
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
+        self.embed_figure(fig, 7, "08_mouse_hesitation.png")
 
     def draw_tab9(self):
         fig, ax = plt.subplots(figsize=(10, 5))
@@ -604,7 +633,7 @@ class EyeTrackingDashboard:
         
         plt.tight_layout()
         plt.subplots_adjust(bottom=0.15)
-        FigureCanvasTkAgg(fig, master=self.tabs[8]).get_tk_widget().pack(fill=tk.BOTH, expand=1)
+        self.embed_figure(fig, 8, "09_consecutive_orders.png")
 
 if __name__ == "__main__":
     root = tk.Tk()
